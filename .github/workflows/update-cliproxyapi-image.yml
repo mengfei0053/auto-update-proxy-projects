@@ -16,7 +16,7 @@ jobs:
   check-and-build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
@@ -89,3 +89,22 @@ jobs:
             BUILD_DATE=${{ steps.meta.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: 创建 Release (显示更新后的镜像)
+        if: steps.compare.outputs.need_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          gh release create "cliproxyapi-${TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "CLIProxyAPI ${TAG}" \
+            --notes "已更新并推送 Docker 镜像：
+
+          \`\`\`bash
+          docker pull ${IMAGE}:${TAG}
+          docker pull ${IMAGE}:latest
+          \`\`\`
+
+          - 上游 release: https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}
+          - 架构: ${PLATFORMS}"
