@@ -1,5 +1,6 @@
 name: Update CLIProxyAPI Image
 
+# 自动检查上游 release 并构建推送镜像到 GHCR
 on:
   schedule:
     # 北京时间每天 00:00 (晚上12点) == UTC 16:00。偏移到 :07 避开整点高峰。
