@@ -1,0 +1,99 @@
+name: Update OmniRoute Image
+
+# 自动检查上游 release 并构建推送镜像到 GHCR
+on:
+  schedule:
+    # 北京时间每天 00:00 (晚上12点) == UTC 16:00。偏移到 :27 错开其它任务。
+    - cron: '27 16 * * *'
+  workflow_dispatch:        # 允许在 Actions 页面手动触发测试
+
+env:
+  UPSTREAM_REPO: diegosouzapw/OmniRoute
+  IMAGE: ghcr.io/mengfei0053/proxy-agents-omniroute
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: 获取上游最新 release tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh release view --repo "$UPSTREAM_REPO" --json tagName -q .tagName)
+          echo "上游最新版本: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # 优先用 PAT (write:packages)，没有则回退到 GITHUB_TOKEN
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: 对比镜像仓库中是否已有该版本
+        id: compare
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          if docker manifest inspect "$IMAGE:$TAG" > /dev/null 2>&1; then
+            echo "镜像 $IMAGE:$TAG 已存在，无需构建。"
+            echo "need_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "镜像 $IMAGE:$TAG 不存在，上游有更新，开始构建。"
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 检出上游代码 (指定 tag)
+        if: steps.compare.outputs.need_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.upstream.outputs.tag }}
+          fetch-depth: 0
+
+      - name: 设置 QEMU (多架构)
+        if: steps.compare.outputs.need_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        if: steps.compare.outputs.need_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建并推送
+        if: steps.compare.outputs.need_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.upstream.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 创建 Release (显示更新后的镜像)
+        if: steps.compare.outputs.need_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          gh release create "omniroute-${TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "OmniRoute ${TAG}" \
+            --notes "已更新并推送 Docker 镜像：
+
+          \`\`\`bash
+          docker pull ${IMAGE}:${TAG}
+          docker pull ${IMAGE}:latest
+          \`\`\`
+
+          - 上游 release: https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}
+          - 架构: ${PLATFORMS}"
