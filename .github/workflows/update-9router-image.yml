@@ -3,8 +3,8 @@ name: Update 9router Image
 on:
   schedule:
     # 北京时间每天 00:00 (晚上12点) == UTC 16:00。偏移到 :17 错开其它任务。
-    - cron: '17 16 * * *'
-  workflow_dispatch:        # 允许在 Actions 页面手动触发测试
+    - cron: "17 16 * * *"
+  workflow_dispatch: # 允许在 Actions 页面手动触发测试
 
 env:
   UPSTREAM_REPO: decolua/9router
@@ -80,15 +80,47 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.upstream.outputs.tag }}"
-          gh release create "9router-${TAG}" \
-            --repo "${{ github.repository }}" \
-            --title "9router ${TAG}" \
-            --notes "已更新并推送 Docker 镜像：
+          UPSTREAM_RELEASE_URL="https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}"
+          UPSTREAM_REPO_URL="https://github.com/${UPSTREAM_REPO}"
+          UPSTREAM_NOTES=$(gh release view "$TAG" --repo "$UPSTREAM_REPO" --json body -q .body)
+          CHANGELOG_URL=""
+          for file in CHANGELOG.md Changelog.md changelog.md CHANGELOG CHANGELOG.txt; do
+            if [ -f "$file" ]; then
+              CHANGELOG_URL="${UPSTREAM_REPO_URL}/blob/${TAG}/${file}"
+              break
+            fi
+          done
+          if [ -n "$CHANGELOG_URL" ]; then
+            CHANGELOG_LINK="- 上游 CHANGELOG: ${CHANGELOG_URL}"
+          else
+            CHANGELOG_LINK="- 上游 CHANGELOG: 未在仓库根目录找到 CHANGELOG 文件"
+          fi
+
+          cat > release-notes.md <<EOF
+          已更新并推送 Docker 镜像：
 
           \`\`\`bash
           docker pull ${IMAGE}:${TAG}
           docker pull ${IMAGE}:latest
           \`\`\`
 
-          - 上游 release: https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}
-          - 架构: ${PLATFORMS}"
+          ## 改动摘要 / CHANGELOG
+
+          以下内容来自上游 Release/CHANGELOG：
+
+          ${UPSTREAM_NOTES}
+
+          ## 相关链接
+
+          - 上游仓库: ${UPSTREAM_REPO_URL}
+          - 上游 Release: ${UPSTREAM_RELEASE_URL}
+          ${CHANGELOG_LINK}
+          - 镜像: ${IMAGE}:${TAG}
+          - 架构: ${PLATFORMS}
+          EOF
+
+          gh release create "9router-${TAG}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "9router ${TAG}" \
+            --notes-file release-notes.md
