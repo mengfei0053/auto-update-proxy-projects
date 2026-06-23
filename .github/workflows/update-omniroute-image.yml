@@ -25,7 +25,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=$(gh release view --repo "$UPSTREAM_REPO" --json tagName -q .tagName)
+          TAG=$(gh release view \
+            --repo "$UPSTREAM_REPO" \
+            --json tagName \
+            -q .tagName)
           echo "上游最新版本: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
@@ -57,6 +60,19 @@ jobs:
           ref: ${{ steps.upstream.outputs.tag }}
           fetch-depth: 0
 
+      - name: 修正 apt cache 并发锁
+        if: steps.compare.outputs.need_build == 'true'
+        run: |
+          # OmniRoute 上游 Dockerfile 使用 apt cache mount 且 sharing=shared。
+          # 多架构并行构建时会同时访问 apt lists，导致 apt lock 冲突。
+          sed -i -E \
+            '/cache\/apt/ s/sharing=shared/sharing=locked/g' \
+            Dockerfile
+          sed -i -E \
+            '/lib\/apt\/lists/ s/sharing=shared/sharing=locked/g' \
+            Dockerfile
+          git diff -- Dockerfile || true
+
       - name: 设置 QEMU (多架构)
         if: steps.compare.outputs.need_build == 'true'
         uses: docker/setup-qemu-action@v3
@@ -85,11 +101,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.upstream.outputs.tag }}"
-          UPSTREAM_RELEASE_URL="https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}"
           UPSTREAM_REPO_URL="https://github.com/${UPSTREAM_REPO}"
-          UPSTREAM_NOTES=$(gh release view "$TAG" --repo "$UPSTREAM_REPO" --json body -q .body)
+          UPSTREAM_RELEASE_URL="${UPSTREAM_REPO_URL}/releases/tag/${TAG}"
+          UPSTREAM_NOTES=$(gh release view "$TAG" \
+            --repo "$UPSTREAM_REPO" \
+            --json body \
+            -q .body)
           CHANGELOG_URL=""
-          for file in CHANGELOG.md Changelog.md changelog.md CHANGELOG CHANGELOG.txt; do
+          for file in \
+            CHANGELOG.md Changelog.md changelog.md CHANGELOG CHANGELOG.txt; do
             if [ -f "$file" ]; then
               CHANGELOG_URL="${UPSTREAM_REPO_URL}/blob/${TAG}/${file}"
               break
