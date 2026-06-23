@@ -48,20 +48,28 @@ docker pull ghcr.io/mengfei0053/proxy-agents-omniroute:latest
 
 如果需要固定版本，请将 `latest` 替换为上游 Release tag。
 
-## GHCR 权限配置
+## 权限配置
 
-工作流使用以下凭据登录 GHCR：
+工作流需要两类权限：
+
+1. 推送 GHCR 镜像。
+2. 在当前仓库创建 Release，记录本次更新的镜像和上游 changelog。
+
+登录 GHCR 时使用：
 
 ```yaml
 password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 ```
 
-建议在仓库 Secrets 中配置 `GHCR_TOKEN`：
+建议在仓库 Secrets 中配置：
 
-- 类型：classic PAT
-- 权限：`write:packages`
+| Secret | 用途 | 建议权限 |
+| --- | --- | --- |
+| `GHCR_TOKEN` | 推送用户作用域 GHCR package | classic PAT，`write:packages` |
+| `RELEASE_TOKEN` | 创建当前仓库 Release | classic PAT，`repo` |
 
-原因：这些镜像是用户作用域的 GHCR package，默认 `GITHUB_TOKEN` 不一定具备写入已有 package 的权限。
+如果仓库设置允许 `GITHUB_TOKEN` 写入 contents，也可以不配置
+`RELEASE_TOKEN`。如果不允许，Release 创建会输出 warning，但不会影响已经完成的镜像推送。
 
 工作流中已声明：
 

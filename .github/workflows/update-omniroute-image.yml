@@ -98,8 +98,11 @@ jobs:
       - name: 创建 Release (显示更新后的镜像)
         if: steps.compare.outputs.need_build == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          export GH_TOKEN="${RELEASE_TOKEN:-${GHCR_TOKEN:-$GITHUB_TOKEN}}"
           TAG="${{ steps.upstream.outputs.tag }}"
           UPSTREAM_REPO_URL="https://github.com/${UPSTREAM_REPO}"
           UPSTREAM_RELEASE_URL="${UPSTREAM_REPO_URL}/releases/tag/${TAG}"
@@ -144,8 +147,11 @@ jobs:
           - 架构: ${PLATFORMS}
           EOF
 
-          gh release create "omniroute-${TAG}" \
+          if ! gh release create "omniroute-${TAG}" \
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "OmniRoute ${TAG}" \
-            --notes-file release-notes.md
+            --notes-file release-notes.md; then
+            echo "::warning::镜像已推送，但创建 GitHub Release 失败。"
+            echo "请检查 RELEASE_TOKEN 或仓库 Actions 权限。"
+          fi
