@@ -1,7 +1,8 @@
+---
 name: Update OmniRoute Image
 
 # 自动检查上游 release 并构建推送镜像到 GHCR
-on:
+"on":
   schedule:
     # 北京时间每天 00:00 (晚上12点) == UTC 16:00。偏移到 :27 错开其它任务。
     - cron: "27 16 * * *"
@@ -73,6 +74,21 @@ jobs:
             Dockerfile
           git diff -- Dockerfile || true
 
+      - name: 释放 runner 磁盘空间
+        if: steps.compare.outputs.need_build == 'true'
+        run: |
+          echo "磁盘空间（清理前）:"
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af || true
+          echo "磁盘空间（清理后）:"
+          df -h
+
       - name: 设置 QEMU (多架构)
         if: steps.compare.outputs.need_build == 'true'
         uses: docker/setup-qemu-action@v3
@@ -93,7 +109,7 @@ jobs:
             ${{ env.IMAGE }}:${{ steps.upstream.outputs.tag }}
             ${{ env.IMAGE }}:latest
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       - name: 创建 Release (显示更新后的镜像)
         if: steps.compare.outputs.need_build == 'true'
