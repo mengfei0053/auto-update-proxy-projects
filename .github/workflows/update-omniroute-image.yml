@@ -97,19 +97,84 @@ jobs:
         if: steps.compare.outputs.need_build == 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: 构建并推送
+      # 同一台 ubuntu-latest 上并行构建 linux/amd64 与 linux/arm64 时，
+      # Next.js 编译会把内存打满并被 SIGKILL（cannot allocate memory）。
+      # 上游 Dockerfile 按单架构约 9GB 预算编写。这里逐个架构构建并推送
+      # digest，最后再合成 $IMAGE:$TAG 与 $IMAGE:latest 这一个多架构 manifest。
+      # provenance 必须关闭，否则每个 digest 会是带 attestation 的 index，
+      # 合并后出现 unknown/unknown，而不是 linux/amd64 + linux/arm64。
+      - name: 构建并推送 linux/amd64
         if: steps.compare.outputs.need_build == 'true'
+        id: build-amd64
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.upstream.outputs.tag }}
-            ${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,mode=min,scope=linux-amd64
+
+      - name: 释放 BuildKit 缓存（架构之间）
+        if: steps.compare.outputs.need_build == 'true'
+        run: |
+          # 只清本地缓存，给下一个架构留磁盘。保留 builder，
+          # build-push-action 结束时还要用它导出构建记录。
+          docker buildx prune --all --force || true
+          df -h
+
+      - name: 构建并推送 linux/arm64
+        if: steps.compare.outputs.need_build == 'true'
+        id: build-arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=linux-arm64
+          cache-to: type=gha,mode=min,scope=linux-arm64
+
+      - name: 合并多架构 manifest
+        if: steps.compare.outputs.need_build == 'true'
+        run: |
+          set -euo pipefail
+          if [ "$PLATFORMS" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::PLATFORMS ($PLATFORMS) 与串行构建步骤不一致。"
+            exit 1
+          fi
+          TAG="${{ steps.upstream.outputs.tag }}"
+          AMD64_DIGEST="${{ steps.build-amd64.outputs.digest }}"
+          ARM64_DIGEST="${{ steps.build-arm64.outputs.digest }}"
+          if [ -z "$AMD64_DIGEST" ] || [ -z "$ARM64_DIGEST" ]; then
+            echo "::error::缺少单架构镜像 digest，无法合并 manifest。"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            -t "$IMAGE:$TAG" \
+            -t "$IMAGE:latest" \
+            "$IMAGE@$AMD64_DIGEST" \
+            "$IMAGE@$ARM64_DIGEST"
+          docker buildx imagetools inspect --raw "$IMAGE:$TAG" > manifest.json
+          docker buildx imagetools inspect --raw "$IMAGE:latest" > manifest-latest.json
+          echo "合并后的 manifest:"
+          cat manifest.json
+          jq -e '
+            [ .manifests[]
+              | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))
+            ] | length == 2
+          ' manifest.json >/dev/null
+          jq -e '
+            [ .manifests[] | select(.platform.architecture == "unknown") ] | length == 0
+          ' manifest.json >/dev/null
+          jq -S . manifest.json > manifest.norm.json
+          jq -S . manifest-latest.json > manifest-latest.norm.json
+          cmp manifest.norm.json manifest-latest.norm.json
+          echo "已发布多架构镜像 $IMAGE:$TAG 与 $IMAGE:latest"
 
       - name: 创建 Release (显示更新后的镜像)
         if: steps.compare.outputs.need_build == 'true'
