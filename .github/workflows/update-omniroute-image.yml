@@ -74,6 +74,26 @@ jobs:
             Dockerfile
           git diff -- Dockerfile || true
 
+      - name: 单进程 webpack 编译
+        if: steps.compare.outputs.need_build == 'true'
+        run: |
+          # next.config 打开 webpackBuildWorker 后，`next build` 的父进程和
+          # webpack worker 各自继承 Dockerfile 里的
+          # NODE_OPTIONS=--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}
+          # （默认 6144）。上游在这个配置下测得容器峰值约 11.1 GiB；8 GiB
+          # 上限会把 build worker SIGKILL（docs/guides/DOCKER_GUIDE.md）。
+          # 跑 39709086218 死在「Creating an optimized production build」，
+          # 还没到 page-data。关掉 worker 后编译留在父进程的一个堆里。
+          # 不把堆降到 3072/4096：上游记录 webpack 生产遍峰值约 3.9 GiB，
+          # 4 GiB 会间歇性打成 V8 heap OOM（Dockerfile #10060）。
+          count=$(grep -c 'webpackBuildWorker: true' next.config.mjs || true)
+          if [ "$count" != "1" ]; then
+            echo "::error::next.config.mjs 里 webpackBuildWorker: true 出现 ${count:-0} 次，预期 1 次。上游配置变了，需要更新这个步骤。"
+            exit 1
+          fi
+          sed -i 's/webpackBuildWorker: true/webpackBuildWorker: false/' next.config.mjs
+          grep -n 'webpackBuildWorker:' next.config.mjs
+
       - name: 释放 runner 磁盘空间
         if: steps.compare.outputs.need_build == 'true'
         run: |
@@ -89,6 +109,24 @@ jobs:
           echo "磁盘空间（清理后）:"
           df -h
 
+      - name: 增加 swap（单架构 Next 构建）
+        if: steps.compare.outputs.need_build == 'true'
+        run: |
+          # ubuntu-latest（本次失败的镜像是 ubuntu-26.04）大约 8 GiB 物理内存：
+          # /dev/shm 为 3.9 GiB。上面的单进程编译把峰值从两个 6144 堆降下来，
+          # 但上游测得的工作集仍可能超过这 8 GiB，arm64 还要再过一遍 QEMU。
+          # 8 GiB swap 让内核把尖峰换出，而不是再 SIGKILL。不用更大的付费 runner。
+          echo "内存（swap 前）:"
+          free -h
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl vm.swappiness=60
+          echo "内存（swap 后）:"
+          free -h
+          df -h /
+
       - name: 设置 QEMU (多架构)
         if: steps.compare.outputs.need_build == 'true'
         uses: docker/setup-qemu-action@v3
@@ -99,8 +137,10 @@ jobs:
 
       # 同一台 ubuntu-latest 上并行构建 linux/amd64 与 linux/arm64 时，
       # Next.js 编译会把内存打满并被 SIGKILL（cannot allocate memory）。
-      # 上游 Dockerfile 按单架构约 9GB 预算编写。这里逐个架构构建并推送
-      # digest，最后再合成 $IMAGE:$TAG 与 $IMAGE:latest 这一个多架构 manifest。
+      # 上游 Dockerfile 按单架构约 9GB 预算编写，但 webpackBuildWorker 会让
+      # 父进程和 worker 各拿一份 OMNIROUTE_BUILD_MEMORY_MB。这里逐个架构
+      # 构建并推送 digest，并钉住上游的低内存构建参数。
+      # 最后再合成 $IMAGE:$TAG 与 $IMAGE:latest 这一个多架构 manifest。
       # provenance 必须关闭，否则每个 digest 会是带 attestation 的 index，
       # 合并后出现 unknown/unknown，而不是 linux/amd64 + linux/arm64。
       - name: 构建并推送 linux/amd64
@@ -113,6 +153,10 @@ jobs:
           platforms: linux/amd64
           provenance: false
           sbom: false
+          build-args: |
+            OMNIROUTE_USE_TURBOPACK=0
+            OMNIROUTE_BUILD_MEMORY_MB=6144
+            OMNIROUTE_BUILD_WORKERS=2
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=linux-amd64
           cache-to: type=gha,mode=min,scope=linux-amd64
@@ -135,6 +179,10 @@ jobs:
           platforms: linux/arm64
           provenance: false
           sbom: false
+          build-args: |
+            OMNIROUTE_USE_TURBOPACK=0
+            OMNIROUTE_BUILD_MEMORY_MB=6144
+            OMNIROUTE_BUILD_WORKERS=2
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=linux-arm64
           cache-to: type=gha,mode=min,scope=linux-arm64
