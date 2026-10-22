@@ -1,6 +1,6 @@
 # Auto Update Proxy Projects
 
-这个仓库用于自动跟踪若干上游项目的 GitHub Release，并将对应版本构建成 Docker 镜像推送到 GHCR（GitHub Container Registry）。
+这个仓库用于自动跟踪若干上游项目的 GitHub Release，并把对应版本的 Docker 镜像发布到 GHCR（GitHub Container Registry）。CLIProxyAPI 与 9router 在 runner 上构建；OmniRoute 从上游已发布的多架构镜像复制。
 
 仓库本身不包含应用源码，主要维护的是 `.github/workflows/` 下的 GitHub Actions 工作流。
 
@@ -16,7 +16,7 @@
 
 ## 自动更新逻辑
 
-每个工作流的核心逻辑一致：
+共同逻辑：
 
 1. 使用 GitHub CLI 查询上游仓库最新 Release tag：
 
@@ -26,15 +26,26 @@
 
 2. 登录 GHCR。
 3. 使用 `docker manifest inspect "$IMAGE:$TAG"` 检查目标镜像仓库是否已经存在该 tag。
-   - 已存在：跳过构建。
-   - 不存在：认为上游有新版本，需要构建并推送。
-4. 检出上游仓库指定 tag。
-5. 使用 Docker Buildx 构建镜像，并推送：
-   - `:<tag>`
-   - `:latest`
-6. 构建成功后，在当前仓库创建一条 Release，记录镜像、上游 Release、CHANGELOG 等信息。
+   - 已存在：跳过。
+   - 不存在：认为上游有新版本，需要发布。
+4. 对 CLIProxyAPI 与 9router：检出上游仓库指定 tag，用 Docker Buildx 构建并推送 `:<tag>` 和 `:latest`。
+5. 发布成功后，在当前仓库创建一条 Release，记录镜像、上游 Release、CHANGELOG 等信息。
 
 > 版本对比只基于镜像 tag 是否存在，不做 semver 比较。
+
+### OmniRoute
+
+OmniRoute 不在 runner 上构建（Next.js 会把 `ubuntu-latest` 打到内存上限）。上游 [`diegosouzapw/OmniRoute`](https://github.com/diegosouzapw/OmniRoute) 的 release tag 带前导 `v`（例如 `v3.8.52`），已发布镜像 tag 去掉这一个 `v`：
+
+- `ghcr.io/diegosouzapw/omniroute:3.8.52`
+- `diegosouzapw/omniroute:3.8.52`（Docker Hub）
+
+两个仓库都是公开的多架构镜像（`linux/amd64` 与 `linux/arm64`）。工作流优先用 `skopeo copy --all` 复制 GHCR，源不存在时再试 Docker Hub，推送到：
+
+- `ghcr.io/mengfei0053/proxy-agents-omniroute:v3.8.52`（与上游 release tagName 一致）
+- `ghcr.io/mengfei0053/proxy-agents-omniroute:latest`
+
+是否需要复制仍用 `docker manifest inspect` 检查我们自己的 `:$TAG`。Release 说明仍记录上游 Release 正文；根目录 CHANGELOG 通过 Git tree API 查找，不再 checkout 上游仓库。
 
 ## 拉取镜像
 

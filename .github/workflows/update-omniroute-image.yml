@@ -1,7 +1,12 @@
----
 name: Update OmniRoute Image
 
-# 自动检查上游 release 并构建推送镜像到 GHCR
+# 检查上游 release。我们的 GHCR 还没有该 tag 时，从上游已发布的多架构镜像复制。
+# 不在 runner 上 docker build：Next.js 构建会把 ubuntu-latest 打到 OOM。
+#
+# 源镜像 tag 与上游 release tagName 不一致：git tag 带前导 v（v3.8.52），
+# 上游 docker-publish 用 scripts/ci/resolve-docker-publish-version.sh 去掉这一个
+# v，所以镜像是 ghcr.io/diegosouzapw/omniroute:3.8.52（Docker Hub 同名 tag）。
+# 推到我们仓库时仍用上游 release tagName（v3.8.52）和 latest，保持现有拉取约定。
 "on":
   schedule:
     # 北京时间每天 00:00 (晚上12点) == UTC 16:00。偏移到 :27 错开其它任务。
@@ -10,11 +15,14 @@ name: Update OmniRoute Image
 
 env:
   UPSTREAM_REPO: diegosouzapw/OmniRoute
+  # 源 tag = release tagName 去掉一个前导 v。优先公开的 GHCR，没有再试 Docker Hub。
+  UPSTREAM_IMAGE_GHCR: ghcr.io/diegosouzapw/omniroute
+  UPSTREAM_IMAGE_DOCKERHUB: docker.io/diegosouzapw/omniroute
   IMAGE: ghcr.io/mengfei0053/proxy-agents-omniroute
   PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  check-and-build:
+  check-and-copy:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -26,12 +34,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG=$(gh release view \
             --repo "$UPSTREAM_REPO" \
             --json tagName \
             -q .tagName)
+          if [ -z "$TAG" ]; then
+            echo "::error::上游 release tag 为空"
+            exit 1
+          fi
+          # 只去掉一个前导 v，与上游 docker-publish 一致。
+          # v3.8.52 → 3.8.52。没有前导 v 时源 tag 与 release tag 相同。
+          VERSION="${TAG#v}"
           echo "上游最新版本: $TAG"
+          echo "上游镜像 tag: $VERSION"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: 登录 GHCR
         uses: docker/login-action@v3
@@ -44,205 +62,115 @@ jobs:
       - name: 对比镜像仓库中是否已有该版本
         id: compare
         run: |
+          set -euo pipefail
           TAG="${{ steps.upstream.outputs.tag }}"
           if docker manifest inspect "$IMAGE:$TAG" > /dev/null 2>&1; then
-            echo "镜像 $IMAGE:$TAG 已存在，无需构建。"
-            echo "need_build=false" >> "$GITHUB_OUTPUT"
+            echo "镜像 $IMAGE:$TAG 已存在，无需复制。"
+            echo "need_copy=false" >> "$GITHUB_OUTPUT"
           else
-            echo "镜像 $IMAGE:$TAG 不存在，上游有更新，开始构建。"
-            echo "need_build=true" >> "$GITHUB_OUTPUT"
+            echo "镜像 $IMAGE:$TAG 不存在，上游有更新，开始复制。"
+            echo "need_copy=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 检出上游代码 (指定 tag)
-        if: steps.compare.outputs.need_build == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ steps.upstream.outputs.tag }}
-          fetch-depth: 0
-
-      - name: 修正 apt cache 并发锁
-        if: steps.compare.outputs.need_build == 'true'
-        run: |
-          # OmniRoute 上游 Dockerfile 使用 apt cache mount 且 sharing=shared。
-          # 多架构并行构建时会同时访问 apt lists，导致 apt lock 冲突。
-          sed -i -E \
-            '/cache\/apt/ s/sharing=shared/sharing=locked/g' \
-            Dockerfile
-          sed -i -E \
-            '/lib\/apt\/lists/ s/sharing=shared/sharing=locked/g' \
-            Dockerfile
-          git diff -- Dockerfile || true
-
-      - name: 单进程 webpack 编译
-        if: steps.compare.outputs.need_build == 'true'
-        run: |
-          # next.config 打开 webpackBuildWorker 后，`next build` 的父进程和
-          # webpack worker 各自继承 Dockerfile 里的
-          # NODE_OPTIONS=--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}
-          # （默认 6144）。上游在这个配置下测得容器峰值约 11.1 GiB；8 GiB
-          # 上限会把 build worker SIGKILL（docs/guides/DOCKER_GUIDE.md）。
-          # 跑 39709086218 死在「Creating an optimized production build」，
-          # 还没到 page-data。关掉 worker 后编译留在父进程的一个堆里。
-          # 不把堆降到 3072/4096：上游记录 webpack 生产遍峰值约 3.9 GiB，
-          # 4 GiB 会间歇性打成 V8 heap OOM（Dockerfile #10060）。
-          count=$(grep -c 'webpackBuildWorker: true' next.config.mjs || true)
-          if [ "$count" != "1" ]; then
-            echo "::error::next.config.mjs 里 webpackBuildWorker: true 出现 ${count:-0} 次，预期 1 次。上游配置变了，需要更新这个步骤。"
-            exit 1
-          fi
-          sed -i 's/webpackBuildWorker: true/webpackBuildWorker: false/' next.config.mjs
-          grep -n 'webpackBuildWorker:' next.config.mjs
-
-      - name: 释放 runner 磁盘空间
-        if: steps.compare.outputs.need_build == 'true'
-        run: |
-          echo "磁盘空间（清理前）:"
-          df -h
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /usr/local/share/boost \
-            "$AGENT_TOOLSDIRECTORY"
-          docker system prune -af || true
-          echo "磁盘空间（清理后）:"
-          df -h
-
-      - name: 增加 swap（单架构 Next 构建）
-        if: steps.compare.outputs.need_build == 'true'
-        run: |
-          # ubuntu-latest（本次失败的镜像是 ubuntu-26.04）大约 8 GiB 物理内存：
-          # /dev/shm 为 3.9 GiB。上面的单进程编译把峰值从两个 6144 堆降下来，
-          # 但上游测得的工作集仍可能超过这 8 GiB，arm64 还要再过一遍 QEMU。
-          # 8 GiB swap 让内核把尖峰换出，而不是再 SIGKILL。不用更大的付费 runner。
-          echo "内存（swap 前）:"
-          free -h
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          sudo sysctl vm.swappiness=60
-          echo "内存（swap 后）:"
-          free -h
-          df -h /
-
-      - name: 设置 QEMU (多架构)
-        if: steps.compare.outputs.need_build == 'true'
-        uses: docker/setup-qemu-action@v3
-
-      - name: 设置 Buildx
-        if: steps.compare.outputs.need_build == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      # 同一台 ubuntu-latest 上并行构建 linux/amd64 与 linux/arm64 时，
-      # Next.js 编译会把内存打满并被 SIGKILL（cannot allocate memory）。
-      # 上游 Dockerfile 按单架构约 9GB 预算编写，但 webpackBuildWorker 会让
-      # 父进程和 worker 各拿一份 OMNIROUTE_BUILD_MEMORY_MB。这里逐个架构
-      # 构建并推送 digest，并钉住上游的低内存构建参数。
-      # 最后再合成 $IMAGE:$TAG 与 $IMAGE:latest 这一个多架构 manifest。
-      # provenance 必须关闭，否则每个 digest 会是带 attestation 的 index，
-      # 合并后出现 unknown/unknown，而不是 linux/amd64 + linux/arm64。
-      - name: 构建并推送 linux/amd64
-        if: steps.compare.outputs.need_build == 'true'
-        id: build-amd64
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          provenance: false
-          sbom: false
-          build-args: |
-            OMNIROUTE_USE_TURBOPACK=0
-            OMNIROUTE_BUILD_MEMORY_MB=6144
-            OMNIROUTE_BUILD_WORKERS=2
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=linux-amd64
-          cache-to: type=gha,mode=min,scope=linux-amd64
-
-      - name: 释放 BuildKit 缓存（架构之间）
-        if: steps.compare.outputs.need_build == 'true'
-        run: |
-          # 只清本地缓存，给下一个架构留磁盘。保留 builder，
-          # build-push-action 结束时还要用它导出构建记录。
-          docker buildx prune --all --force || true
-          df -h
-
-      - name: 构建并推送 linux/arm64
-        if: steps.compare.outputs.need_build == 'true'
-        id: build-arm64
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/arm64
-          provenance: false
-          sbom: false
-          build-args: |
-            OMNIROUTE_USE_TURBOPACK=0
-            OMNIROUTE_BUILD_MEMORY_MB=6144
-            OMNIROUTE_BUILD_WORKERS=2
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=linux-arm64
-          cache-to: type=gha,mode=min,scope=linux-arm64
-
-      - name: 合并多架构 manifest
-        if: steps.compare.outputs.need_build == 'true'
+      - name: 安装 skopeo
+        if: steps.compare.outputs.need_copy == 'true'
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
-          if [ "$PLATFORMS" != "linux/amd64,linux/arm64" ]; then
-            echo "::error::PLATFORMS ($PLATFORMS) 与串行构建步骤不一致。"
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          skopeo --version
+
+      - name: 复制上游多架构镜像
+        id: copy
+        if: steps.compare.outputs.need_copy == 'true'
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          AUTH_FILE="${RUNNER_TEMP}/ghcr-auth.json"
+          umask 077
+          AUTH_B64=$(printf '%s:%s' "$GHCR_USER" "$GHCR_PASSWORD" | base64 -w0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$AUTH_B64" > "$AUTH_FILE"
+
+          SRC_GHCR="${UPSTREAM_IMAGE_GHCR}:${VERSION}"
+          SRC_DOCKERHUB="${UPSTREAM_IMAGE_DOCKERHUB}:${VERSION}"
+          if skopeo inspect --raw "docker://${SRC_GHCR}" >/dev/null 2>&1; then
+            SRC="$SRC_GHCR"
+          elif skopeo inspect --raw "docker://${SRC_DOCKERHUB}" >/dev/null 2>&1; then
+            SRC="$SRC_DOCKERHUB"
+          else
+            echo "::error::找不到公开上游镜像 ${SRC_GHCR} 或 ${SRC_DOCKERHUB}。release tag ${TAG} 的镜像 tag 已去掉前导 v。"
             exit 1
           fi
-          TAG="${{ steps.upstream.outputs.tag }}"
-          AMD64_DIGEST="${{ steps.build-amd64.outputs.digest }}"
-          ARM64_DIGEST="${{ steps.build-arm64.outputs.digest }}"
-          if [ -z "$AMD64_DIGEST" ] || [ -z "$ARM64_DIGEST" ]; then
-            echo "::error::缺少单架构镜像 digest，无法合并 manifest。"
-            exit 1
-          fi
-          docker buildx imagetools create \
-            -t "$IMAGE:$TAG" \
-            -t "$IMAGE:latest" \
-            "$IMAGE@$AMD64_DIGEST" \
-            "$IMAGE@$ARM64_DIGEST"
-          docker buildx imagetools inspect --raw "$IMAGE:$TAG" > manifest.json
-          docker buildx imagetools inspect --raw "$IMAGE:latest" > manifest-latest.json
-          echo "合并后的 manifest:"
-          cat manifest.json
-          jq -e '
-            [ .manifests[]
-              | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))
-            ] | length == 2
-          ' manifest.json >/dev/null
-          jq -e '
-            [ .manifests[] | select(.platform.architecture == "unknown") ] | length == 0
-          ' manifest.json >/dev/null
-          jq -S . manifest.json > manifest.norm.json
-          jq -S . manifest-latest.json > manifest-latest.norm.json
-          cmp manifest.norm.json manifest-latest.norm.json
-          echo "已发布多架构镜像 $IMAGE:$TAG 与 $IMAGE:latest"
+          echo "从 ${SRC} 复制到 ${IMAGE}:latest 与 ${IMAGE}:${TAG}"
+          echo "source=${SRC}" >> "$GITHUB_OUTPUT"
+
+          # latest 先于 $TAG。跳过条件只看 $IMAGE:$TAG，所以版本 tag 最后写：
+          # 中途失败时下次调度仍会重试，不会留下“有 tag、没有 latest”的状态。
+          copy_tag() {
+            local dest_tag="$1"
+            # --preserve-digests 让目标 index 与上游 digest 一致，多架构和 attestation 都保留。
+            skopeo copy --all --preserve-digests \
+              --dest-authfile "$AUTH_FILE" \
+              "docker://${SRC}" \
+              "docker://${IMAGE}:${dest_tag}"
+          }
+          copy_tag latest
+          copy_tag "$TAG"
+
+          SRC_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${SRC}")
+          assert_copied() {
+            local dest_tag="$1"
+            local raw dest_digest
+            raw=$(skopeo inspect --raw --authfile "$AUTH_FILE" "docker://${IMAGE}:${dest_tag}")
+            if ! printf '%s' "$raw" | jq -e '
+              ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")] | length > 0)
+              and
+              ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")] | length > 0)
+            ' >/dev/null; then
+              echo "::error::${IMAGE}:${dest_tag} 缺少 linux/amd64 或 linux/arm64"
+              exit 1
+            fi
+            dest_digest=$(skopeo inspect --authfile "$AUTH_FILE" --format '{{.Digest}}' "docker://${IMAGE}:${dest_tag}")
+            if [ "$dest_digest" != "$SRC_DIGEST" ]; then
+              echo "::error::${IMAGE}:${dest_tag} digest ${dest_digest} 与上游 ${SRC_DIGEST} 不一致"
+              exit 1
+            fi
+          }
+          assert_copied latest
+          assert_copied "$TAG"
+          rm -f "$AUTH_FILE"
+          echo "已复制多架构镜像 ${IMAGE}:${TAG} 与 ${IMAGE}:latest（${SRC_DIGEST}）"
 
       - name: 创建 Release (显示更新后的镜像)
-        if: steps.compare.outputs.need_build == 'true'
+        if: steps.compare.outputs.need_copy == 'true'
         env:
           RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          SOURCE: ${{ steps.copy.outputs.source }}
         run: |
+          set -euo pipefail
           export GH_TOKEN="${RELEASE_TOKEN:-${GHCR_TOKEN:-$GITHUB_TOKEN}}"
-          TAG="${{ steps.upstream.outputs.tag }}"
           UPSTREAM_REPO_URL="https://github.com/${UPSTREAM_REPO}"
           UPSTREAM_RELEASE_URL="${UPSTREAM_REPO_URL}/releases/tag/${TAG}"
           UPSTREAM_NOTES=$(gh release view "$TAG" \
             --repo "$UPSTREAM_REPO" \
             --json body \
-            -q .body)
+            -q .body || true)
           CHANGELOG_URL=""
+          # 不再 checkout 上游仓库。根目录 CHANGELOG 用 git tree API 判断。
+          ROOT_PATHS=$(gh api "repos/${UPSTREAM_REPO}/git/trees/${TAG}" --jq '.tree[].path' || true)
           for file in \
             CHANGELOG.md Changelog.md changelog.md CHANGELOG CHANGELOG.txt; do
-            if [ -f "$file" ]; then
+            if printf '%s\n' "$ROOT_PATHS" | grep -qx "$file"; then
               CHANGELOG_URL="${UPSTREAM_REPO_URL}/blob/${TAG}/${file}"
               break
             fi
@@ -254,12 +182,15 @@ jobs:
           fi
 
           cat > release-notes.md <<EOF
-          已更新并推送 Docker 镜像：
+          已从上游已发布镜像复制并推送（未在 runner 上重新构建）：
 
           \`\`\`bash
           docker pull ${IMAGE}:${TAG}
           docker pull ${IMAGE}:latest
           \`\`\`
+
+          - 来源镜像: ${SOURCE}
+          - 上游 release tag \`${TAG}\` 对应镜像 tag \`${VERSION}\`（去掉前导 v）
 
           ## 改动摘要 / CHANGELOG
 
